@@ -9,12 +9,16 @@ import (
 	"sync"
 	"time"
 
-	lassiehttp "github.com/filecoin-project/lassie/pkg/server/http"
+	lassiehttp "github.com/filecoin-project/lassie/pkg/httputil"
+	"github.com/filecoin-project/lassie/pkg/httputil/metadata"
+	"github.com/filecoin-project/lassie/pkg/types"
 	lassietypes "github.com/filecoin-project/lassie/pkg/types"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-unixfsnode"
 	"github.com/ipld/go-ipld-prime/datamodel"
 	"github.com/ipld/go-ipld-prime/linking"
+	mh "github.com/multiformats/go-multihash"
+	"lukechampine.com/blake3"
 )
 
 var _ http.Handler = (*HttpIpfs)(nil)
@@ -86,7 +90,7 @@ func (hi *HttpIpfs) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	includeDupes, err := lassiehttp.CheckFormat(req)
+	includeDupes, includeMeta, err := lassiehttp.CheckFormat(req)
 	if err != nil {
 		logError(http.StatusBadRequest, err)
 		return
@@ -120,30 +124,82 @@ func (hi *HttpIpfs) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	selNode := unixfsnode.UnixFSPathSelectorBuilder(path.String(), dagScope.TerminalSelectorSpec(), false)
 
 	bytesWrittenCh := make(chan struct{})
-	writer := newIpfsResponseWriter(res, hi.maxResponseBytes, func() {
+	var writer io.Writer = newIpfsResponseWriter(res, hi.maxResponseBytes, func() {
 		// called once we start writing blocks into the CAR (on the first Put())
 		res.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
 		res.Header().Set("Accept-Ranges", lassiehttp.ResponseAcceptRangesHeader)
 		res.Header().Set("Cache-Control", lassiehttp.ResponseCacheControlHeader)
-		res.Header().Set("Content-Type", lassiehttp.ResponseContentTypeHeader)
+		res.Header().Set("Content-Type", lassiehttp.RequestAcceptHeader) // instead of ResponseContentTypeHeader because we are doing meta=eof as well
 		res.Header().Set("Etag", etag(rootCid, path.String(), dagScope, includeDupes))
 		res.Header().Set("X-Content-Type-Options", "nosniff")
 		res.Header().Set("X-Ipfs-Path", "/"+datamodel.ParsePath(req.URL.Path).String())
 		close(bytesWrittenCh)
 	})
 
-	if err := StreamCar(ctx, hi.lsys, rootCid, selNode, writer, includeDupes); err != nil {
-		logError(http.StatusInternalServerError, err)
+	if includeMeta {
+		writer = newChecksumWriter(writer)
+	}
+
+	dataBytes, blockCount, carErr := StreamCar(ctx, hi.lsys, rootCid, selNode, writer, includeDupes)
+
+	if includeMeta {
+		// write NUL byte to indicate end of CARv1 data
+		if _, err := res.Write([]byte{0}); err != nil {
+			if carErr != nil {
+				carErr = err
+			}
+		}
+		// write the metadata
+		md := metadata.Metadata{
+			Request: metadata.Request{
+				Root:       rootCid,
+				Scope:      dagScope,
+				Duplicates: includeDupes,
+			},
+		}
+		if path.Len() != 0 {
+			p := "/" + path.String()
+			md.Request.Path = &p
+		}
+
+		if carErr != nil {
+			msg := carErr.Error()
+			md.Error = &msg
+		} else {
+			checksum := writer.(*checksumWriter).Sum()
+			checksumMh, err := mh.Encode(checksum, mh.BLAKE3)
+			if err != nil {
+				msg := fmt.Sprintf("error creating checksum multihash: %s", err.Error())
+				md.Error = &msg
+				carErr = err
+			} else {
+				md.Properties = &types.CarProperties{
+					CarBytes:          writer.(*checksumWriter).Count(),
+					DataBytes:         dataBytes,
+					BlockCount:        blockCount,
+					ChecksumMultihash: checksumMh,
+				}
+			}
+		}
+
+		err := metadata.CarMetadata{Metadata: &md}.Serialize(res)
+		if err != nil && carErr != nil {
+			carErr = err
+		}
+	}
+
+	if carErr != nil {
+		logError(http.StatusInternalServerError, carErr)
 		select {
 		case <-bytesWrittenCh:
-			logger.Debugw("unclean close", "cid", rootCid, "err", err)
+			logger.Debugw("unclean close", "cid", rootCid, "err", carErr)
 			if err := closeWithUnterminatedChunk(res); err != nil {
 				logger.Infow("unable to send early termination", "err", err)
 			}
 			return
 		default:
 		}
-		logger.Debugw("error streaming CAR", "cid", rootCid, "err", err)
+		logger.Debugw("error streaming CAR", "cid", rootCid, "err", carErr)
 	}
 }
 
@@ -206,4 +262,33 @@ func closeWithUnterminatedChunk(res http.ResponseWriter) error {
 		return fmt.Errorf("closing write conn: %w", err)
 	}
 	return nil
+}
+
+type checksumWriter struct {
+	w io.Writer
+	h *blake3.Hasher
+	c int64
+}
+
+func newChecksumWriter(w io.Writer) *checksumWriter {
+	return &checksumWriter{
+		w: w,
+		h: blake3.New(32, nil),
+	}
+}
+
+func (hw *checksumWriter) Write(p []byte) (n int, err error) {
+	if _, err := hw.h.Write(p); err != nil {
+		return 0, err
+	}
+	hw.c += int64(len(p))
+	return hw.w.Write(p)
+}
+
+func (hw *checksumWriter) Sum() []byte {
+	return hw.h.Sum(nil)
+}
+
+func (hw *checksumWriter) Count() int64 {
+	return hw.c
 }
