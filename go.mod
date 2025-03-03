@@ -1,6 +1,7 @@
 module github.com/ipld/frisbii
 
 go 1.22.0
+toolchain go1.23.6
 
 require (
 	github.com/NYTimes/gziphandler v1.1.1
@@ -21,7 +22,7 @@ require (
 	github.com/ipni/go-libipni v0.6.15
 	github.com/ipni/index-provider v0.15.5
 	github.com/libp2p/go-libp2p v0.38.1
-	github.com/multiformats/go-multiaddr v0.14.0
+	github.com/multiformats/go-multiaddr v0.15.0
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/stretchr/testify v1.10.0
 	github.com/urfave/cli/v2 v2.27.5
